@@ -1,0 +1,98 @@
+#!/bin/sh
+set -eu
+
+METADATA_URL="${METADATA_URL:-http://metadata:8080}"
+REGISTRY_URL="${REGISTRY_URL:-http://registry:5000}"
+PUBLISHER_TOKEN="${PUBLISHER_TOKEN:-local-publisher-token}"
+
+repo_get() {
+  curl -fsS "${METADATA_URL}/$1"
+}
+
+current_chain() {
+  timestamp="$(repo_get metadata/timestamp.json)"
+  snapshot_version="$(printf '%s' "$timestamp" | jq -er '.signed.meta["snapshot.json"].version')"
+  snapshot="$(repo_get "metadata/${snapshot_version}.snapshot.json")"
+  targets_version="$(printf '%s' "$snapshot" | jq -er '.signed.meta["targets.json"].version')"
+  targets="$(repo_get "metadata/${targets_version}.targets.json")"
+}
+
+case "${1:-}" in
+  admit)
+    platform="${2:-linux/amd64}"
+    repository="${3:-acme/release-api}"
+    replica="${4:-admission-a}"
+    curl -sS "http://${replica}:8081/admit?repository=${repository}&channel=stable&platform=${platform}" | jq .
+    ;;
+  incident)
+    jq '{retired_keyid: .compromised_keyid, status: "retired", pinned_client_root: "/operator/client/1.root.json"}' /operator/incident.json
+    ;;
+  inspect|metadata)
+    current_chain
+    jq -n \
+      --argjson timestamp "$timestamp" \
+      --argjson snapshot "$snapshot" \
+      --argjson targets "$targets" \
+      '{
+        timestamp: {
+          version: $timestamp.signed.version,
+          expires: $timestamp.signed.expires,
+          snapshot_version: $timestamp.signed.meta["snapshot.json"].version
+        },
+        snapshot: {
+          version: $snapshot.signed.version,
+          expires: $snapshot.signed.expires,
+          targets_version: $snapshot.signed.meta["targets.json"].version
+        },
+        targets: {
+          version: $targets.signed.version,
+          expires: $targets.signed.expires,
+          channels: $targets.signed.channels,
+          target_count: ($targets.signed.targets | length)
+        }
+      }'
+    ;;
+  release)
+    channel="${2:-stable}"
+    current_chain
+    target_path="$(printf '%s' "$targets" | jq -er --arg channel "$channel" '.signed.channels[$channel]')"
+    repo_get "targets/${target_path}" | jq .
+    ;;
+  index)
+    repository="${2:-acme/release-api}"
+    reference="${3:-stable}"
+    curl -fsS \
+      -H 'Accept: application/vnd.oci.image.index.v1+json' \
+      "${REGISTRY_URL}/v2/${repository}/manifests/${reference}" \
+      | jq '{schemaVersion, mediaType, manifests}'
+    ;;
+  checkpoint)
+    digest="${2:?usage: releasectl checkpoint sha256:DIGEST}"
+    if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+      echo 'checkpoint digest must be sha256 followed by 64 lowercase hexadecimal characters' >&2
+      exit 2
+    fi
+    repo_get "attestations/${digest#sha256:}.json" \
+      | jq '.checkpoint | {
+          body,
+          entry,
+          leaf_index,
+          inclusion_proof_length: (.inclusion_proof | length),
+          consistency_proof_length: (.consistency_proof | length),
+          signers: (.signatures | keys)
+        }'
+    ;;
+  promote)
+    file="${2:?usage: releasectl promote REQUEST.json [publisher-a|publisher-b]}"
+    publisher="${3:-publisher-a}"
+    curl -sS -X POST \
+      -H 'content-type: application/json' \
+      -H "x-release-token: ${PUBLISHER_TOKEN}" \
+      --data-binary "@${file}" \
+      "http://${publisher}:8082/promote" | jq .
+    ;;
+  *)
+    echo "usage: releasectl {incident|metadata|release [CHANNEL]|index [REPOSITORY] [REFERENCE]|checkpoint sha256:DIGEST|admit [PLATFORM] [REPOSITORY] [REPLICA]|promote REQUEST.json [PUBLISHER]}" >&2
+    exit 2
+    ;;
+esac

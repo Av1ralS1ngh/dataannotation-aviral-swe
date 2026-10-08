@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import os
+from pathlib import Path
+
+import requests
+from securesystemslib.signer import CryptoSigner, SSlibKey
+from tuf.api.metadata import Metadata, Root
+
+OPERATOR = Path(os.getenv("OPERATOR_DIR", "/operator"))
+ROOT_KEYS = Path(os.getenv("ROOT_KEYS_DIR", "/root-keys"))
+ETCD = os.getenv("ETCD_URL", "http://etcd:2379")
+
+
+def encoded(value):
+    if isinstance(value, str):
+        value = value.encode()
+    return base64.b64encode(value).decode()
+
+
+def metadata_get(version):
+    response = requests.post(
+        f"{ETCD}/v3/kv/range",
+        json={"key": encoded(f"release/metadata/{version}.root.json")},
+        timeout=10,
+    )
+    response.raise_for_status()
+    values = response.json().get("kvs", [])
+    if not values:
+        raise SystemExit(f"root version {version} is absent")
+    return Metadata[Root].from_bytes(base64.b64decode(values[0]["value"]))
+
+
+def metadata_put(version, metadata):
+    response = requests.post(
+        f"{ETCD}/v3/kv/put",
+        json={
+            "key": encoded(f"release/metadata/{version}.root.json"),
+            "value": encoded(metadata.to_bytes()),
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+
+
+def load_key(name):
+    info = json.loads((ROOT_KEYS / "keyring.json").read_text())[name]
+    key = SSlibKey.from_dict(info["keyid"], info["key"])
+    return CryptoSigner.from_priv_key_uri(
+        f"file2:{ROOT_KEYS / 'keys' / info['private']}", key
+    )
+
+
+def sign(args):
+    metadata = metadata_get(args.version)
+    metadata.sign(load_key(args.key), append=True)
+    metadata_put(args.version, metadata)
+    print(f"signed root {args.version} with {args.key}")
+
+
+def inspect_root(args):
+    metadata = metadata_get(args.version)
+    role = metadata.signed.roles["root"]
+    print(json.dumps({
+        "version": metadata.signed.version,
+        "threshold": role.threshold,
+        "root_keyids": role.keyids,
+        "signatures": list(metadata.signatures),
+    }, indent=2))
+
+
+def verify_chain(_args):
+    old = Metadata[Root].from_file(str(OPERATOR / "client/1.root.json"))
+    new = metadata_get(2)
+    old.signed.verify_delegate("root", new.signed_bytes, new.signatures)
+    new.signed.verify_delegate("root", new.signed_bytes, new.signatures)
+    compromised = json.loads((OPERATOR / "incident.json").read_text())["compromised_keyid"]
+    if compromised in new.signed.roles["root"].keyids:
+        raise SystemExit("new root still authorizes the compromised key")
+    print("root 1 -> root 2 transition is valid; compromised key is removed")
+
+
+parser = argparse.ArgumentParser()
+sub = parser.add_subparsers(required=True)
+p = sub.add_parser("sign")
+p.add_argument("version", type=int)
+p.add_argument("key")
+p.set_defaults(func=sign)
+p = sub.add_parser("inspect")
+p.add_argument("version", type=int, nargs="?", default=2)
+p.set_defaults(func=inspect_root)
+p = sub.add_parser("verify-chain")
+p.set_defaults(func=verify_chain)
+args = parser.parse_args()
+args.func(args)

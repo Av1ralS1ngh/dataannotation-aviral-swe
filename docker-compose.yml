@@ -1,0 +1,212 @@
+x-app: &app
+  build: .
+  image: release-trust:local
+  restart: unless-stopped
+  environment: &app-env
+    REGISTRY_URL: http://registry:5000
+    METADATA_URL: http://metadata:8080
+    COORDINATION_URL: http://coordination:8090
+    ETCD_URL: http://etcd:2379
+    DATABASE_URL: postgresql+psycopg://release_trust:release_trust@postgres/release_trust
+    PUBLISHER_TOKEN: ${PUBLISHER_TOKEN:-local-publisher-token}
+    ADMIN_TOKEN: ${ADMIN_TOKEN:-local-admin-token}
+    COORDINATION_TOKEN: ${COORDINATION_TOKEN:-local-coordination-token}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  registry:
+    image: registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5000/v2/ >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    networks: [service, storage]
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.15@sha256:0934690612905554eb61ddefb9faaaecb47c2f6931dbb453e694358092ee8990
+    command:
+      - etcd
+      - --name=release-metadata
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    volumes:
+      - etcd-data:/etcd-data
+    networks: [storage]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: release_trust
+      POSTGRES_USER: release_trust
+      POSTGRES_PASSWORD: release_trust
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U release_trust"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    volumes:
+      - audit-data:/var/lib/postgresql/data
+    networks: [service]
+
+  bootstrap:
+    <<: *app
+    restart: "no"
+    environment:
+      <<: *app-env
+      SEED_SCENARIO: ${SEED_SCENARIO:-healthy}
+    depends_on:
+      registry: {condition: service_healthy}
+      etcd: {condition: service_healthy}
+    command: ["release-trust-bootstrap"]
+    volumes:
+      - operator:/operator
+      - root-keys:/root-keys
+      - publisher-keys:/publisher-keys
+      - bootstrap-secrets:/bootstrap-secrets
+    networks: [storage]
+
+  metadata:
+    <<: *app
+    depends_on:
+      bootstrap: {condition: service_completed_successfully}
+      etcd: {condition: service_healthy}
+    command:
+      ["uvicorn", "release_trust.metadata:app", "--host", "0.0.0.0", "--port", "8080"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    ports:
+      - "8080:8080"
+    networks: [service, storage]
+
+  coordination:
+    <<: *app
+    depends_on:
+      etcd: {condition: service_healthy}
+    command:
+      ["uvicorn", "release_trust.coordination:app", "--host", "0.0.0.0", "--port", "8090"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8090/healthz >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    networks: [service, storage]
+
+  admission-a:
+    <<: *app
+    environment:
+      <<: *app-env
+      REPLICA_ID: admission-a
+    depends_on:
+      bootstrap: {condition: service_completed_successfully}
+      metadata: {condition: service_healthy}
+      coordination: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+      registry: {condition: service_healthy}
+    command: ["release-trust-supervisor"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/healthz >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    volumes:
+      - operator:/operator:ro
+      - state-a:/state
+    ports:
+      - "8081:8081"
+    networks: [service]
+
+  admission-b:
+    <<: *app
+    environment:
+      <<: *app-env
+      REPLICA_ID: admission-b
+    depends_on:
+      bootstrap: {condition: service_completed_successfully}
+      metadata: {condition: service_healthy}
+      coordination: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+      registry: {condition: service_healthy}
+    command: ["release-trust-supervisor"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/healthz >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    volumes:
+      - operator:/operator:ro
+      - state-b:/state
+    ports:
+      - "8083:8081"
+    networks: [service]
+
+  publisher-a:
+    <<: *app
+    environment:
+      <<: *app-env
+      PUBLISHER_ID: publisher-a
+    depends_on:
+      bootstrap: {condition: service_completed_successfully}
+      etcd: {condition: service_healthy}
+    command:
+      ["uvicorn", "release_trust.publisher:app", "--host", "0.0.0.0", "--port", "8082"]
+    volumes:
+      - publisher-keys:/publisher-keys:ro
+    ports:
+      - "8082:8082"
+    networks: [service, storage]
+
+  publisher-b:
+    <<: *app
+    environment:
+      <<: *app-env
+      PUBLISHER_ID: publisher-b
+    depends_on:
+      bootstrap: {condition: service_completed_successfully}
+      etcd: {condition: service_healthy}
+    command:
+      ["uvicorn", "release_trust.publisher:app", "--host", "0.0.0.0", "--port", "8082"]
+    volumes:
+      - publisher-keys:/publisher-keys:ro
+    ports:
+      - "8084:8082"
+    networks: [service, storage]
+
+  root-operator:
+    <<: *app
+    profiles: ["ops"]
+    restart: "no"
+    depends_on:
+      bootstrap: {condition: service_completed_successfully}
+      etcd: {condition: service_healthy}
+    command: ["sleep", "infinity"]
+    volumes:
+      - operator:/operator:ro
+      - root-keys:/root-keys:ro
+    networks: [storage]
+
+volumes:
+  audit-data:
+  etcd-data:
+  bootstrap-secrets:
+  operator:
+  publisher-keys:
+  root-keys:
+  state-a:
+  state-b:
+
+networks:
+  service:
+  storage:
+    internal: true
